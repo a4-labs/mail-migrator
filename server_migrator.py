@@ -1,30 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Migrator poczty IMAP -> IMAP, wersja SERWEROWA (Koyeb) z web GUI.
-
-- Dziala bez przerwy w tle (osobny watek), bez klikania.
-- Przenosi INBOX + Wyslane (konfigurowalne nizej).
-- Logika 1:1 z wersja desktopowa: dedup po Message-ID, przenoszenie
-  statusu przeczytania, mapowanie folderow na dpoczte, dekodowanie
-  IMAP UTF-7 (polskie nazwy), odpornosc na zerwane polaczenia.
-- PETLA: gdy trafi limit Gmaila / zerwanie, czeka RETRY_HOURS i probuje
-  dalej. Konczy, gdy caly material przeszedl (przebieg bez nowych maili).
-- Web GUI: wejdz na adres aplikacji, zobaczysz status, log i postep.
-
-Konfiguracja przez zmienne srodowiskowe (Koyeb -> Environment) lub .env:
-  SRC_HOST, SRC_PORT, DST_HOST, DST_PORT
-  MAILBOX_1_LABEL, MAILBOX_1_SRC_USER, MAILBOX_1_SRC_PASS,
-  MAILBOX_1_DST_USER, MAILBOX_1_DST_PASS   (obsluga wielu: _2, _3, ...)
-Opcjonalnie:
-  FOLDERS=INBOX,[Gmail]/Wyslane   (domyslnie wlasnie te dwa)
-  WORKERS=2
-  RETRY_HOURS=6
-  AUTOSTART=1   (1 = migracja rusza od razu po starcie serwera)
+Migrator poczty IMAP -> IMAP, wersja SERWEROWA z interaktywnym Web GUI.
 """
 
 import os
-import re
 import time
 import base64
 import imaplib
@@ -32,61 +12,72 @@ import email
 import threading
 from datetime import datetime, timezone
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, request, render_template_string
 
 imaplib._MAXLINE = 10_000_000
-ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
+# ===================== STAN GLOBALNY =====================
 
-# ===================== KONFIGURACJA =====================
+class State:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.status = "oczekuje"      # oczekuje / pracuje / czeka_limit / zakonczono / blad
+        self.phase = ""
+        self.current_folder = ""
+        self.folder_done = 0
+        self.folder_total = 0
+        self.copied_total = 0
+        self.skipped_total = 0
+        self.seen_marked_total = 0
+        self.cycle = 0
+        self.next_retry_ts = None
+        self.started_at = None
+        self.finished = False
+        self.log_lines = []
+        
+        # Zmienne konfiguracyjne z formularza
+        self.src_host = ""
+        self.src_port = 993
+        self.src_user = ""
+        self.src_pass = ""
+        self.dst_host = ""
+        self.dst_port = 993
+        self.dst_user = ""
+        self.dst_pass = ""
+        self.folders = []
+        self.workers = 2
+        self.retry_hours = 6.0
 
-def load_env_file(path):
-    data = {}
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, _, v = line.partition("=")
-                data[k.strip()] = v.strip().strip('"').strip("'")
-    return data
+    def log(self, msg):
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        with self.lock:
+            self.log_lines.append(line)
+            if len(self.log_lines) > 500:
+                self.log_lines = self.log_lines[-500:]
+        print(line, flush=True)
 
+    def snapshot(self):
+        with self.lock:
+            return {
+                "status": self.status, "phase": self.phase,
+                "current_folder": self.current_folder,
+                "folder_done": self.folder_done,
+                "folder_total": self.folder_total,
+                "copied_total": self.copied_total,
+                "skipped_total": self.skipped_total,
+                "seen_marked_total": self.seen_marked_total,
+                "cycle": self.cycle,
+                "next_retry_ts": self.next_retry_ts,
+                "started_at": self.started_at,
+                "finished": self.finished,
+                "folders": self.folders, "workers": self.workers,
+                "retry_hours": self.retry_hours,
+                "log": self.log_lines[-200:],
+            }
 
-# zmienne srodowiskowe maja pierwszenstwo, .env jako fallback (lokalnie)
-_ENVFILE = load_env_file(ENV_PATH)
-
-
-def cfg(key, default=""):
-    return os.environ.get(key, _ENVFILE.get(key, default))
-
-
-def parse_mailboxes():
-    src_host = cfg("SRC_HOST", "imap.gmail.com")
-    src_port = cfg("SRC_PORT", "993")
-    dst_host = cfg("DST_HOST", "imap.dpoczta.pl")
-    dst_port = cfg("DST_PORT", "993")
-    boxes = []
-    i = 1
-    while True:
-        p = f"MAILBOX_{i}_"
-        if not cfg(f"{p}SRC_USER"):
-            break
-        boxes.append({
-            "label": cfg(f"{p}LABEL", f"Skrzynka {i}"),
-            "src_host": src_host, "src_port": src_port,
-            "src_user": cfg(f"{p}SRC_USER"), "src_pass": cfg(f"{p}SRC_PASS"),
-            "dst_host": dst_host, "dst_port": dst_port,
-            "dst_user": cfg(f"{p}DST_USER"), "dst_pass": cfg(f"{p}DST_PASS"),
-        })
-        i += 1
-    return boxes
-
-
-FOLDERS = [f.strip() for f in cfg("FOLDERS", "INBOX,[Gmail]/Wyslane").split(",") if f.strip()]
-WORKERS = int(cfg("WORKERS", "2"))
-RETRY_HOURS = float(cfg("RETRY_HOURS", "6"))
-AUTOSTART = cfg("AUTOSTART", "1") == "1"
+STATE = State()
+_started = threading.Event()
 
 
 # ===================== IMAP: pomocnicze =====================
@@ -116,12 +107,10 @@ def imap_utf7_decode(s):
             res.append(c); i += 1
     return ''.join(res)
 
-
 def connect(host, port, user, password):
     m = imaplib.IMAP4_SSL(host, int(port))
     m.login(user, password)
     return m
-
 
 def target_name(src_folder):
     decoded = imap_utf7_decode(src_folder)
@@ -142,7 +131,6 @@ def target_name(src_folder):
     }
     return mapping.get(low, decoded.replace('[Gmail]/', '').replace('/', '.'))
 
-
 def norm_msgid(value):
     if not value:
         return None
@@ -150,72 +138,16 @@ def norm_msgid(value):
         value = value.decode('utf-8', errors='replace')
     return value.strip().strip('<>').strip().lower()
 
-
-# ===================== STAN (dla web GUI) =====================
-
-class State:
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.status = "oczekuje"      # oczekuje / pracuje / czeka_limit / zakonczono / blad
-        self.phase = ""
-        self.current_folder = ""
-        self.folder_done = 0
-        self.folder_total = 0
-        self.copied_total = 0
-        self.skipped_total = 0
-        self.seen_marked_total = 0
-        self.cycle = 0
-        self.next_retry_ts = None
-        self.started_at = datetime.now(timezone.utc).isoformat()
-        self.finished = False
-        self.log_lines = []
-
-    def log(self, msg):
-        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}"
-        with self.lock:
-            self.log_lines.append(line)
-            if len(self.log_lines) > 500:
-                self.log_lines = self.log_lines[-500:]
-        print(line, flush=True)
-
-    def snapshot(self):
-        with self.lock:
-            return {
-                "status": self.status, "phase": self.phase,
-                "current_folder": self.current_folder,
-                "folder_done": self.folder_done,
-                "folder_total": self.folder_total,
-                "copied_total": self.copied_total,
-                "skipped_total": self.skipped_total,
-                "seen_marked_total": self.seen_marked_total,
-                "cycle": self.cycle,
-                "next_retry_ts": self.next_retry_ts,
-                "started_at": self.started_at,
-                "finished": self.finished,
-                "folders": FOLDERS, "workers": WORKERS,
-                "retry_hours": RETRY_HOURS,
-                "log": self.log_lines[-200:],
-            }
-
-
-STATE = State()
-_started = threading.Event()
-
-
 # ===================== LOGIKA MIGRACJI =====================
 
 def is_limit_error(exc):
-    """Czy wyjatek wyglada na limit/zerwanie Gmaila."""
     s = str(exc).lower()
     keys = ['eof', 'limit', 'too many', 'try again', 'unavailable',
             'bandwidth', 'connection reset', 'timed out', 'broken pipe',
             'socket error']
     return any(k in s for k in keys)
 
-
 def existing_index(dst, target, st):
-    """(existing set, unseen_map) z folderu docelowego - dedup + naprawa statusu."""
     existing, unseen = set(), {}
     try:
         typ, _ = dst.select(f'"{target}"')
@@ -249,7 +181,6 @@ def existing_index(dst, target, st):
     except Exception as e:
         st.log(f"   (indeks duplikatow: {e})")
     return existing, unseen
-
 
 def mark_seen(dst_cfg, target, msgids, st):
     if not msgids:
@@ -290,19 +221,11 @@ def mark_seen(dst_cfg, target, msgids, st):
         st.log(f"   [seen] blad: {e}")
     finally:
         if dst:
-            try:
-                dst.logout()
-            except Exception:
-                pass
+            try: dst.logout()
+            except Exception: pass
     return marked
 
-
-class LimitHit(Exception):
-    pass
-
-
-def worker(wid, src_cfg, dst_cfg, folder, target, job_ids,
-           existing, ex_lock, counters, c_lock, unseen, seen_msgids, s_lock, st):
+def worker(wid, src_cfg, dst_cfg, folder, target, job_ids, existing, ex_lock, counters, c_lock, unseen, seen_msgids, s_lock, st):
     try:
         src = connect(**src_cfg)
         dst = connect(**dst_cfg)
@@ -324,29 +247,21 @@ def worker(wid, src_cfg, dst_cfg, folder, target, job_ids,
                 if tf == 'OK' and fd:
                     for fp in fd:
                         blob = fp if isinstance(fp, bytes) else (fp[0] if isinstance(fp, tuple) else None)
-                        if not blob:
-                            continue
+                        if not blob: continue
                         try:
                             fl = imaplib.ParseFlags(blob)
-                            flags = ' '.join(x.decode() if isinstance(x, bytes) else x
-                                             for x in fl
-                                             if (x.decode() if isinstance(x, bytes) else x) != '\\Recent')
-                        except Exception:
-                            pass
-                        try:
-                            internaldate = imaplib.Internaldate2tuple(blob)
-                        except Exception:
-                            pass
+                            flags = ' '.join(x.decode() if isinstance(x, bytes) else x for x in fl if (x.decode() if isinstance(x, bytes) else x) != '\\Recent')
+                        except Exception: pass
+                        try: internaldate = imaplib.Internaldate2tuple(blob)
+                        except Exception: pass
 
                 typ, md = src.fetch(mid, '(RFC822)')
-                if typ != 'OK' or not md:
-                    continue
+                if typ != 'OK' or not md: continue
                 raw = None
                 for part in md:
                     if isinstance(part, tuple) and part[1]:
                         raw = part[1]; break
-                if raw is None:
-                    continue
+                if raw is None: continue
 
                 try:
                     parsed = email.message_from_bytes(raw)
@@ -359,61 +274,42 @@ def worker(wid, src_cfg, dst_cfg, folder, target, job_ids,
                 if msgid:
                     with ex_lock:
                         already = msgid in existing
-                        if not already:
-                            existing.add(msgid)
+                        if not already: existing.add(msgid)
                     if already:
                         if was_seen:
                             num = None
-                            with ex_lock:
-                                num = unseen.pop(msgid, None)
+                            with ex_lock: num = unseen.pop(msgid, None)
                             if num:
                                 try:
                                     dst.select(f'"{target}"')
                                     dst.store(num, '+FLAGS', '(\\Seen)')
-                                except Exception:
-                                    pass
-                        with c_lock:
-                            counters['skipped'] += 1
-                        with st.lock:
-                            st.skipped_total += 1
+                                except Exception: pass
+                        with c_lock: counters['skipped'] += 1
+                        with st.lock: st.skipped_total += 1
                         continue
 
-                ta, _ = dst.append(f'"{target}"',
-                                   f'({flags})' if flags else None,
-                                   internaldate, raw)
+                ta, _ = dst.append(f'"{target}"', f'({flags})' if flags else None, internaldate, raw)
                 if was_seen and ta == 'OK' and msgid:
-                    with s_lock:
-                        seen_msgids.append(msgid)
-                with c_lock:
-                    counters['done'] += 1
+                    with s_lock: seen_msgids.append(msgid)
+                with c_lock: counters['done'] += 1
                 with st.lock:
                     st.copied_total += 1
                     st.folder_done += 1
             except Exception as e:
                 if is_limit_error(e):
                     st.log(f"   [watek {wid}] LIMIT/zerwanie: {e}")
-                    with c_lock:
-                        counters['limit'] = True
+                    with c_lock: counters['limit'] = True
                     break
                 st.log(f"   [watek {wid}] blad maila: {e}")
                 continue
     finally:
         for c in (src, dst):
-            try:
-                c.logout()
-            except Exception:
-                pass
+            try: c.logout()
+            except Exception: pass
 
-
-def migrate_once(box, st):
-    """Jeden przebieg po wszystkich folderach. Zwraca:
-       'done'  - przeszlo wszystko, brak nowych,
-       'limit' - trafiono limit, trzeba czekac,
-       'progress' - cos przeszlo, warto isc dalej od razu."""
-    src_cfg = {"host": box["src_host"], "port": box["src_port"],
-               "user": box["src_user"], "password": box["src_pass"]}
-    dst_cfg = {"host": box["dst_host"], "port": box["dst_port"],
-               "user": box["dst_user"], "password": box["dst_pass"]}
+def migrate_once(st):
+    src_cfg = {"host": st.src_host, "port": st.src_port, "user": st.src_user, "password": st.src_pass}
+    dst_cfg = {"host": st.dst_host, "port": st.dst_port, "user": st.dst_user, "password": st.dst_pass}
 
     try:
         src = connect(**src_cfg)
@@ -425,7 +321,7 @@ def migrate_once(box, st):
     any_new = False
     hit_limit = False
     try:
-        for folder in FOLDERS:
+        for folder in st.folders:
             target = target_name(folder)
             with st.lock:
                 st.current_folder = f"{folder} -> {target}"
@@ -436,8 +332,7 @@ def migrate_once(box, st):
             for attempt in range(2):
                 try:
                     typ, _ = src.select(f'"{folder}"', readonly=True)
-                    if typ == 'OK':
-                        opened = True; break
+                    if typ == 'OK': opened = True; break
                 except Exception as e:
                     st.log(f"   otwarcie: {e}")
                     if attempt == 0:
@@ -445,12 +340,10 @@ def migrate_once(box, st):
                         except Exception: pass
                         try: dst.logout()
                         except Exception: pass
-                        try:
-                            src = connect(**src_cfg); dst = connect(**dst_cfg)
+                        try: src = connect(**src_cfg); dst = connect(**dst_cfg)
                         except Exception as e2:
                             st.log(f"   wznowienie polaczen: {e2}")
-                            if is_limit_error(e2):
-                                return 'limit'
+                            if is_limit_error(e2): return 'limit'
                             break
             if not opened:
                 st.log(f"   pomijam '{folder}'")
@@ -468,7 +361,7 @@ def migrate_once(box, st):
                 st.folder_total = len(ids)
             st.log(f"   maili w zrodle: {len(ids)}")
 
-            n = max(1, min(WORKERS, len(ids)))
+            n = max(1, min(st.workers, len(ids)))
             buckets = [[] for _ in range(n)]
             for idx, mid in enumerate(ids):
                 buckets[idx % n].append(mid)
@@ -479,24 +372,17 @@ def migrate_once(box, st):
 
             threads = []
             for wid in range(n):
-                if not buckets[wid]:
-                    continue
-                t = threading.Thread(target=worker, args=(
-                    wid + 1, src_cfg, dst_cfg, folder, target, buckets[wid],
-                    existing, ex_lock, counters, c_lock, unseen,
-                    seen_msgids, s_lock, st), daemon=True)
+                if not buckets[wid]: continue
+                t = threading.Thread(target=worker, args=(wid + 1, src_cfg, dst_cfg, folder, target, buckets[wid], existing, ex_lock, counters, c_lock, unseen, seen_msgids, s_lock, st), daemon=True)
                 threads.append(t); t.start()
-            for t in threads:
-                t.join()
+            for t in threads: t.join()
 
-            if counters['done'] > 0:
-                any_new = True
+            if counters['done'] > 0: any_new = True
             st.log(f"   skopiowano {counters['done']}, pominieto {counters['skipped']}")
 
             if seen_msgids:
                 m = mark_seen(dst_cfg, target, seen_msgids, st)
-                with st.lock:
-                    st.seen_marked_total += m
+                with st.lock: st.seen_marked_total += m
                 st.log(f"   oznaczono przeczytane: {m}")
 
             if counters['limit']:
@@ -505,27 +391,16 @@ def migrate_once(box, st):
                 break
     finally:
         for c in (src, dst):
-            try:
-                c.logout()
-            except Exception:
-                pass
+            try: c.logout()
+            except Exception: pass
 
-    if hit_limit:
-        return 'limit'
-    if any_new:
-        return 'progress'
+    if hit_limit: return 'limit'
+    if any_new: return 'progress'
     return 'done'
 
-
 def run_loop():
-    boxes = parse_mailboxes()
-    if not boxes:
-        STATE.status = "blad"
-        STATE.log("BRAK KONFIGURACJI: ustaw MAILBOX_1_* w zmiennych srodowiskowych.")
-        return
-    box = boxes[0]  # wersja serwerowa: jedna skrzynka (pierwsza)
-    STATE.log(f"Start migracji: {box['label']} ({box['src_user']} -> {box['dst_user']})")
-    STATE.log(f"Foldery: {', '.join(FOLDERS)} | watki: {WORKERS} | retry: {RETRY_HOURS}h")
+    STATE.log(f"Start migracji: {STATE.src_user} -> {STATE.dst_user}")
+    STATE.log(f"Foldery: {', '.join(STATE.folders)} | watki: {STATE.workers} | retry: {STATE.retry_hours}h")
 
     while True:
         with STATE.lock:
@@ -534,7 +409,7 @@ def run_loop():
             STATE.next_retry_ts = None
         STATE.log(f"--- Przebieg #{STATE.cycle} ---")
         try:
-            result = migrate_once(box, STATE)
+            result = migrate_once(STATE)
         except Exception as e:
             STATE.log(f"Blad przebiegu: {e}")
             result = 'limit' if is_limit_error(e) else 'error'
@@ -544,34 +419,26 @@ def run_loop():
                 STATE.status = "zakonczono"
                 STATE.finished = True
             STATE.log(">>> GOTOWE. Caly material przeniesiony, brak nowych maili.")
-            STATE.log(">>> Mozesz przepiac MX na dpoczte. Serwer mozna wylaczyc.")
             return
         elif result == 'error':
-            wait = RETRY_HOURS * 3600
+            wait = STATE.retry_hours * 3600
             nxt = time.time() + wait
             with STATE.lock:
                 STATE.status = "czeka_limit"
                 STATE.next_retry_ts = nxt
-            STATE.log(f"Blad. Ponawiam za {RETRY_HOURS}h.")
+            STATE.log(f"Blad. Ponawiam za {STATE.retry_hours}h.")
             time.sleep(wait)
         elif result == 'limit':
-            wait = RETRY_HOURS * 3600
+            wait = STATE.retry_hours * 3600
             nxt = time.time() + wait
             with STATE.lock:
                 STATE.status = "czeka_limit"
                 STATE.next_retry_ts = nxt
-            STATE.log(f"Limit Gmaila. Czekam {RETRY_HOURS}h i probuje dalej.")
+            STATE.log(f"Limit Gmaila. Czekam {STATE.retry_hours}h i probuje dalej.")
             time.sleep(wait)
-        else:  # progress - idz dalej od razu, krotka przerwa
+        else:
             STATE.log("Przebieg dograł nowe maile. Kontynuuje po 60s.")
             time.sleep(60)
-
-
-def ensure_started():
-    if not _started.is_set():
-        _started.set()
-        threading.Thread(target=run_loop, daemon=True).start()
-
 
 # ===================== WEB GUI =====================
 
@@ -580,120 +447,272 @@ app = Flask(__name__)
 PAGE = """<!doctype html><html lang="pl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Migrator poczty</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#0d1117;--panel:#161b22;--bd:#30363d;--tx:#e6edf3;
---mut:#8b949e;--acc:#2f81f7;--ok:#3fb950;--warn:#d29922;--err:#f85149;}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--tx);
-font-family:'SF Mono',ui-monospace,'Cascadia Code',Consolas,monospace;
-padding:24px;line-height:1.5}
-.wrap{max-width:860px;margin:0 auto}
-h1{font-size:18px;font-weight:600;margin-bottom:2px;letter-spacing:.3px}
-.sub{color:var(--mut);font-size:12px;margin-bottom:20px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
-gap:10px;margin-bottom:18px}
-.card{background:var(--panel);border:1px solid var(--bd);border-radius:8px;
-padding:12px 14px}
-.card .k{color:var(--mut);font-size:11px;text-transform:uppercase;
-letter-spacing:.5px;margin-bottom:4px}
-.card .v{font-size:20px;font-weight:600}
-.badge{display:inline-block;padding:4px 12px;border-radius:20px;font-size:12px;
-font-weight:600}
-.b-pracuje{background:rgba(47,129,247,.15);color:var(--acc)}
-.b-czeka_limit{background:rgba(210,153,34,.15);color:var(--warn)}
-.b-zakonczono{background:rgba(63,185,80,.15);color:var(--ok)}
-.b-blad{background:rgba(248,81,73,.15);color:var(--err)}
-.b-oczekuje{background:rgba(139,148,158,.15);color:var(--mut)}
-.bar{height:6px;background:#21262d;border-radius:4px;overflow:hidden;margin-top:10px}
-.bar>i{display:block;height:100%;background:var(--acc);width:0;
-transition:width .4s ease}
-.log{background:#010409;border:1px solid var(--bd);border-radius:8px;
-padding:14px;height:380px;overflow-y:auto;font-size:12px;white-space:pre-wrap;
-word-break:break-word}
-.log div{padding:1px 0;color:#c9d1d9}
-.row{display:flex;justify-content:space-between;align-items:center;
-margin-bottom:14px;flex-wrap:wrap;gap:8px}
-.muted{color:var(--mut);font-size:12px}
-.retry{color:var(--warn);font-size:13px;margin-top:6px}
+:root {
+  --bg-color: #0b0f19;
+  --panel-bg: rgba(22, 27, 34, 0.7);
+  --border: rgba(255, 255, 255, 0.1);
+  --text-main: #e6edf3;
+  --text-muted: #8b949e;
+  --accent: #3b82f6;
+  --accent-hover: #2563eb;
+  --success: #10b981;
+  --warning: #f59e0b;
+  --error: #ef4444;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg-color);
+  background-image: radial-gradient(circle at top right, rgba(59, 130, 246, 0.15), transparent 40%),
+                    radial-gradient(circle at bottom left, rgba(16, 185, 129, 0.1), transparent 40%);
+  background-attachment: fixed;
+  color: var(--text-main);
+  font-family: 'Inter', sans-serif;
+  padding: 2rem;
+  line-height: 1.6;
+  min-height: 100vh;
+}
+.wrap { max-width: 900px; margin: 0 auto; }
+.glass-panel {
+  background: var(--panel-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+}
+h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; background: linear-gradient(to right, #60a5fa, #a78bfa); -webkit-background-clip: text; color: transparent; }
+.sub { color: var(--text-muted); font-size: 14px; margin-bottom: 30px; }
+
+/* Form styles */
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
+.form-group { display: flex; flex-direction: column; gap: 8px; }
+.form-group label { font-size: 13px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.form-control {
+  background: rgba(0,0,0,0.2);
+  border: 1px solid var(--border);
+  color: #fff;
+  padding: 12px 16px;
+  border-radius: 8px;
+  font-family: 'Inter', sans-serif;
+  font-size: 15px;
+  transition: all 0.2s;
+}
+.form-control:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2); }
+.btn {
+  background: var(--accent);
+  color: white;
+  border: none;
+  padding: 14px 24px;
+  border-radius: 8px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  width: 100%;
+}
+.btn:hover { background: var(--accent-hover); transform: translateY(-1px); }
+.btn:disabled { opacity: 0.7; cursor: not-allowed; transform: none; }
+/* Dashboard styles */
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+.card { background: rgba(0,0,0,0.2); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+.card .k { color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+.card .v { font-size: 24px; font-weight: 700; }
+.badge { display: inline-flex; align-items: center; padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 600; }
+.b-pracuje { background: rgba(59,130,246,0.15); color: #60a5fa; border: 1px solid rgba(59,130,246,0.3); }
+.b-czeka_limit { background: rgba(245,158,11,0.15); color: #fbbf24; border: 1px solid rgba(245,158,11,0.3); }
+.b-zakonczono { background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
+.b-blad { background: rgba(239,68,68,0.15); color: #f87171; border: 1px solid rgba(239,68,68,0.3); }
+.b-oczekuje { background: rgba(139,148,158,0.15); color: var(--text-muted); border: 1px solid rgba(139,148,158,0.3); }
+.bar { height: 8px; background: rgba(0,0,0,0.3); border-radius: 4px; overflow: hidden; margin-top: 12px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.2); }
+.bar>i { display: block; height: 100%; background: linear-gradient(90deg, #3b82f6, #8b5cf6); width: 0; transition: width 0.4s ease; border-radius: 4px; }
+.log { background: #010409; border: 1px solid var(--border); border-radius: 12px; padding: 16px; height: 400px; overflow-y: auto; font-family: ui-monospace, 'Cascadia Code', monospace; font-size: 13px; white-space: pre-wrap; word-break: break-word; }
+.log div { padding: 2px 0; color: #c9d1d9; border-bottom: 1px solid rgba(255,255,255,0.03); }
+.row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
+.hidden { display: none !important; }
+@media (max-width: 600px) { .form-grid { grid-template-columns: 1fr; } }
 </style></head><body><div class="wrap">
-<h1>Migrator poczty &middot; IMAP &rarr; dpoczta</h1>
-<div class="sub" id="meta">laduje...</div>
-<div class="row">
-  <span class="badge b-oczekuje" id="status">...</span>
-  <span class="muted" id="folder"></span>
+
+  <div id="form-view" class="glass-panel hidden">
+    <h1>Konfiguracja Migracji</h1>
+    <div class="sub">Wprowadź dane skrzynek pocztowych, aby rozpocząć proces w tle.</div>
+    <form id="setup-form">
+      <h3>Skrzynka źródłowa (skąd pobieramy)</h3><br>
+      <div class="form-grid">
+        <div class="form-group"><label>Host IMAP</label><input type="text" id="s_host" class="form-control" value="imap.gmail.com" required></div>
+        <div class="form-group"><label>Port</label><input type="number" id="s_port" class="form-control" value="993" required></div>
+        <div class="form-group"><label>Adres E-mail</label><input type="email" id="s_user" class="form-control" placeholder="jan@gmail.com" required></div>
+        <div class="form-group"><label>Hasło (lub hasło aplikacji)</label><input type="password" id="s_pass" class="form-control" required></div>
+      </div>
+      <h3>Skrzynka docelowa (dokąd kopiujemy)</h3><br>
+      <div class="form-grid">
+        <div class="form-group"><label>Host IMAP</label><input type="text" id="d_host" class="form-control" value="imap.dpoczta.pl" required></div>
+        <div class="form-group"><label>Port</label><input type="number" id="d_port" class="form-control" value="993" required></div>
+        <div class="form-group"><label>Adres E-mail</label><input type="email" id="d_user" class="form-control" placeholder="jan@dpoczta.pl" required></div>
+        <div class="form-group"><label>Hasło</label><input type="password" id="d_pass" class="form-control" required></div>
+      </div>
+      <h3>Opcje zaawansowane</h3><br>
+      <div class="form-grid" style="grid-template-columns: 1fr;">
+        <div class="form-group"><label>Foldery do migracji (po przecinku)</label><input type="text" id="folders" class="form-control" value="INBOX,[Gmail]/Wyslane" required></div>
+      </div>
+      <button type="submit" class="btn" id="start-btn">Uruchom Migrację w tle</button>
+    </form>
+  </div>
+
+  <div id="dash-view" class="hidden">
+    <div class="glass-panel" style="margin-bottom: 24px;">
+      <h1>Migrator poczty</h1>
+      <div class="sub" id="meta">ładuje...</div>
+      <div class="row">
+        <span class="badge" id="status">...</span>
+        <span style="color: var(--text-muted); font-size: 14px; font-weight: 500;" id="folder"></span>
+      </div>
+      <div class="grid">
+        <div class="card"><div class="k">Skopiowane</div><div class="v" style="color: var(--success)" id="copied">0</div></div>
+        <div class="card"><div class="k">Pominięte (dubel)</div><div class="v" id="skipped">0</div></div>
+        <div class="card"><div class="k">Oznacz. przeczytane</div><div class="v" id="seen">0</div></div>
+        <div class="card"><div class="k">Przebieg #</div><div class="v" id="cycle">0</div></div>
+      </div>
+      <div class="card">
+        <div class="row" style="margin-bottom: 0;">
+          <div class="k" style="margin: 0;">Postęp bieżącego folderu</div>
+          <div style="font-size:14px; font-weight: 600;"><span id="fd">0</span> / <span id="ft">0</span></div>
+        </div>
+        <div class="bar"><i id="barfill"></i></div>
+        <div style="color: var(--warning); font-size: 13px; margin-top: 8px;" id="retry"></div>
+      </div>
+    </div>
+    <div class="log" id="log"></div>
+  </div>
+
 </div>
-<div class="grid">
-  <div class="card"><div class="k">Skopiowane</div><div class="v" id="copied">0</div></div>
-  <div class="card"><div class="k">Pominiete (dubel)</div><div class="v" id="skipped">0</div></div>
-  <div class="card"><div class="k">Oznacz. przeczyt.</div><div class="v" id="seen">0</div></div>
-  <div class="card"><div class="k">Przebieg #</div><div class="v" id="cycle">0</div></div>
-</div>
-<div class="card" style="margin-bottom:18px">
-  <div class="k">Postep biezacego folderu</div>
-  <div class="v" style="font-size:14px"><span id="fd">0</span> / <span id="ft">0</span></div>
-  <div class="bar"><i id="barfill"></i></div>
-  <div class="retry" id="retry"></div>
-</div>
-<div class="log" id="log"></div>
-</div>
+
 <script>
 function fmtRetry(ts){
   if(!ts) return "";
   const left = Math.max(0, ts*1000 - Date.now());
   const h = Math.floor(left/3600000), m = Math.floor((left%3600000)/60000);
-  return "Nastepna proba za ~"+h+"h "+m+"m";
+  return "Kolejna próba za ~"+h+"h "+m+"m";
 }
-async function tick(){
-  try{
-    const r = await fetch('/api/status'); const s = await r.json();
-    document.getElementById('meta').textContent =
-      'foldery: '+s.folders.join(', ')+'  |  watki: '+s.workers+
-      '  |  retry: '+s.retry_hours+'h  |  start: '+s.started_at.replace('T',' ').slice(0,19)+' UTC';
-    const st = document.getElementById('status');
-    st.textContent = s.status; st.className = 'badge b-'+s.status;
-    document.getElementById('folder').textContent = s.current_folder || '';
-    document.getElementById('copied').textContent = s.copied_total;
-    document.getElementById('skipped').textContent = s.skipped_total;
-    document.getElementById('seen').textContent = s.seen_marked_total;
-    document.getElementById('cycle').textContent = s.cycle;
-    document.getElementById('fd').textContent = s.folder_done;
-    document.getElementById('ft').textContent = s.folder_total;
-    const pct = s.folder_total ? Math.round(100*s.folder_done/s.folder_total) : 0;
-    document.getElementById('barfill').style.width = pct+'%';
-    document.getElementById('retry').textContent =
-      s.status==='czeka_limit' ? fmtRetry(s.next_retry_ts) : '';
-    const log = document.getElementById('log');
-    log.innerHTML = s.log.map(l=>'<div>'+l.replace(/</g,'&lt;')+'</div>').join('');
-    log.scrollTop = log.scrollHeight;
-  }catch(e){}
-}
-setInterval(tick, 2000); tick();
-</script></body></html>"""
 
+let dashActive = false;
+
+async function checkStatus(){
+  try {
+    const r = await fetch('/api/status');
+    const s = await r.json();
+    
+    if (s.status === 'oczekuje' && !dashActive) {
+      document.getElementById('form-view').classList.remove('hidden');
+      document.getElementById('dash-view').classList.add('hidden');
+    } else {
+      dashActive = true;
+      document.getElementById('form-view').classList.add('hidden');
+      document.getElementById('dash-view').classList.remove('hidden');
+      updateDash(s);
+    }
+  } catch(e) {}
+}
+
+function updateDash(s) {
+  let startTxt = s.started_at ? s.started_at.replace('T',' ').slice(0,19)+' UTC' : '-';
+  document.getElementById('meta').textContent =
+    'Foldery: ' + (s.folders||[]).join(', ') + '  |  Wątki: ' + s.workers +
+    '  |  Start: ' + startTxt;
+    
+  const st = document.getElementById('status');
+  st.textContent = s.status.toUpperCase(); 
+  st.className = 'badge b-' + s.status;
+  
+  document.getElementById('folder').textContent = s.current_folder || '';
+  document.getElementById('copied').textContent = s.copied_total;
+  document.getElementById('skipped').textContent = s.skipped_total;
+  document.getElementById('seen').textContent = s.seen_marked_total;
+  document.getElementById('cycle').textContent = s.cycle;
+  document.getElementById('fd').textContent = s.folder_done;
+  document.getElementById('ft').textContent = s.folder_total;
+  
+  const pct = s.folder_total ? Math.round(100*s.folder_done/s.folder_total) : 0;
+  document.getElementById('barfill').style.width = pct+'%';
+  
+  document.getElementById('retry').textContent = s.status === 'czeka_limit' ? fmtRetry(s.next_retry_ts) : '';
+  
+  const log = document.getElementById('log');
+  log.innerHTML = s.log.map(l=>'<div>'+l.replace(/</g,'&lt;')+'</div>').join('');
+  if(log.scrollHeight - log.scrollTop < 600) log.scrollTop = log.scrollHeight;
+}
+
+document.getElementById('setup-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const btn = document.getElementById('start-btn');
+  btn.disabled = true;
+  btn.textContent = 'Uruchamianie...';
+  
+  const payload = {
+    src_host: document.getElementById('s_host').value,
+    src_port: parseInt(document.getElementById('s_port').value),
+    src_user: document.getElementById('s_user').value,
+    src_pass: document.getElementById('s_pass').value,
+    dst_host: document.getElementById('d_host').value,
+    dst_port: parseInt(document.getElementById('d_port').value),
+    dst_user: document.getElementById('d_user').value,
+    dst_pass: document.getElementById('d_pass').value,
+    folders: document.getElementById('folders').value.split(',').map(f=>f.trim()).filter(f=>f)
+  };
+  
+  await fetch('/api/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  
+  checkStatus();
+});
+
+setInterval(checkStatus, 2000);
+checkStatus();
+</script></body></html>"""
 
 @app.route("/")
 def index():
-    ensure_started()
     return render_template_string(PAGE)
-
 
 @app.route("/api/status")
 def api_status():
-    ensure_started()
     return jsonify(STATE.snapshot())
 
+@app.route("/api/start", methods=["POST"])
+def api_start():
+    data = request.json
+    with STATE.lock:
+        if STATE.status != "oczekuje":
+            return jsonify({"error": "Migracja juz zostala uruchomiona."}), 400
+        
+        STATE.src_host = data.get("src_host", "imap.gmail.com")
+        STATE.src_port = data.get("src_port", 993)
+        STATE.src_user = data.get("src_user")
+        STATE.src_pass = data.get("src_pass")
+        
+        STATE.dst_host = data.get("dst_host", "imap.dpoczta.pl")
+        STATE.dst_port = data.get("dst_port", 993)
+        STATE.dst_user = data.get("dst_user")
+        STATE.dst_pass = data.get("dst_pass")
+        
+        STATE.folders = data.get("folders", ["INBOX", "[Gmail]/Wyslane"])
+        STATE.started_at = datetime.now(timezone.utc).isoformat()
+    
+    if not _started.is_set():
+        _started.set()
+        threading.Thread(target=run_loop, daemon=True).start()
+        
+    return jsonify({"success": True})
 
 @app.route("/health")
 def health():
     return "ok", 200
 
-
-# autostart migracji przy uruchomieniu serwera (Koyeb)
-if AUTOSTART:
-    ensure_started()
-
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
-
