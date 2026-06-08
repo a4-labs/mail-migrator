@@ -5,6 +5,7 @@ Migrator poczty IMAP -> IMAP, wersja SERWEROWA z interaktywnym Web GUI.
 """
 
 import os
+import re
 import time
 import base64
 import imaplib
@@ -513,8 +514,41 @@ h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; background: linear-g
   transition: all 0.2s;
   width: 100%;
 }
-.btn:hover { background: var(--accent-hover); transform: translateY(-1px); }
+.btn-secondary {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+.btn:hover { transform: translateY(-1px); }
 .btn:disabled { opacity: 0.7; cursor: not-allowed; transform: none; }
+.btn-secondary:hover { background: rgba(59, 130, 246, 0.1); }
+
+/* Checkboxes */
+.folders-list {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  max-height: 200px;
+  overflow-y: auto;
+  background: rgba(0,0,0,0.2);
+  padding: 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  margin-top: 12px;
+}
+.folder-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+}
+.folder-item input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
 /* Dashboard styles */
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
 .card { background: rgba(0,0,0,0.2); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
@@ -532,12 +566,12 @@ h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; background: linear-g
 .log div { padding: 2px 0; color: #c9d1d9; border-bottom: 1px solid rgba(255,255,255,0.03); }
 .row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
 .hidden { display: none !important; }
-@media (max-width: 600px) { .form-grid { grid-template-columns: 1fr; } }
+@media (max-width: 600px) { .form-grid, .folders-list { grid-template-columns: 1fr; } }
 </style></head><body><div class="wrap">
 
   <div id="form-view" class="glass-panel hidden">
     <h1>Konfiguracja Migracji</h1>
-    <div class="sub">Wprowadź dane skrzynek pocztowych, aby rozpocząć proces w tle.</div>
+    <div class="sub">Wprowadź dane skrzynek pocztowych, wybierz foldery i rozpocznij proces w tle.</div>
     <form id="setup-form">
       <h3>Skrzynka źródłowa (skąd pobieramy)</h3><br>
       <div class="form-grid">
@@ -546,6 +580,17 @@ h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; background: linear-g
         <div class="form-group"><label>Adres E-mail</label><input type="email" id="s_user" class="form-control" placeholder="jan@gmail.com" required></div>
         <div class="form-group"><label>Hasło (lub hasło aplikacji)</label><input type="password" id="s_pass" class="form-control" required></div>
       </div>
+      
+      <div style="margin-bottom: 24px;">
+        <button type="button" class="btn btn-secondary" id="fetch-folders-btn">Pobierz listę folderów ze źródła</button>
+        <div id="folders-container" class="hidden">
+           <div class="form-group" style="margin-top: 12px;">
+             <label>Zaznacz foldery do migracji:</label>
+             <div class="folders-list" id="folders-list"></div>
+           </div>
+        </div>
+      </div>
+
       <h3>Skrzynka docelowa (dokąd kopiujemy)</h3><br>
       <div class="form-grid">
         <div class="form-group"><label>Host IMAP</label><input type="text" id="d_host" class="form-control" value="imap.dpoczta.pl" required></div>
@@ -553,11 +598,8 @@ h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; background: linear-g
         <div class="form-group"><label>Adres E-mail</label><input type="email" id="d_user" class="form-control" placeholder="jan@dpoczta.pl" required></div>
         <div class="form-group"><label>Hasło</label><input type="password" id="d_pass" class="form-control" required></div>
       </div>
-      <h3>Opcje zaawansowane</h3><br>
-      <div class="form-grid" style="grid-template-columns: 1fr;">
-        <div class="form-group"><label>Foldery do migracji (po przecinku)</label><input type="text" id="folders" class="form-control" value="INBOX,[Gmail]/Wyslane" required></div>
-      </div>
-      <button type="submit" class="btn" id="start-btn">Uruchom Migrację w tle</button>
+      
+      <button type="submit" class="btn" id="start-btn" style="background: var(--success); margin-top: 16px;">Uruchom Migrację w tle</button>
     </form>
   </div>
 
@@ -644,8 +686,73 @@ function updateDash(s) {
   if(log.scrollHeight - log.scrollTop < 600) log.scrollTop = log.scrollHeight;
 }
 
+// Obsługa pobierania folderów
+document.getElementById('fetch-folders-btn').addEventListener('click', async (e) => {
+  const btn = e.target;
+  const user = document.getElementById('s_user').value;
+  const pass = document.getElementById('s_pass').value;
+  const host = document.getElementById('s_host').value;
+  const port = document.getElementById('s_port').value;
+  
+  if(!user || !pass || !host) {
+    alert('Wypełnij najpierw dane skrzynki źródłowej (host, email, hasło)!');
+    return;
+  }
+  
+  btn.textContent = 'Pobieranie...';
+  btn.disabled = true;
+  
+  try {
+    const res = await fetch('/api/folders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({host, port, user, pass})
+    });
+    
+    const data = await res.json();
+    if(data.error) {
+      alert('Błąd pobierania: ' + data.error);
+    } else if(data.folders) {
+      const container = document.getElementById('folders-container');
+      const list = document.getElementById('folders-list');
+      list.innerHTML = '';
+      
+      data.folders.forEach(f => {
+        const div = document.createElement('label');
+        div.className = 'folder-item';
+        const chk = document.createElement('input');
+        chk.type = 'checkbox';
+        chk.value = f;
+        // Domyślnie zaznaczamy znane
+        if(f === 'INBOX' || f.toLowerCase().includes('wyslane') || f.toLowerCase().includes('sent')) {
+          chk.checked = true;
+        }
+        div.appendChild(chk);
+        div.appendChild(document.createTextNode(f));
+        list.appendChild(div);
+      });
+      container.classList.remove('hidden');
+    }
+  } catch(e) {
+    alert('Błąd sieci.');
+  }
+  btn.textContent = 'Odśwież listę folderów';
+  btn.disabled = false;
+});
+
+// Start migracji
 document.getElementById('setup-form').addEventListener('submit', async (e) => {
   e.preventDefault();
+  
+  // Zbieranie zaznaczonych folderów
+  const checkboxes = document.querySelectorAll('#folders-list input[type="checkbox"]:checked');
+  let selectedFolders = Array.from(checkboxes).map(c => c.value);
+  
+  if (selectedFolders.length === 0) {
+    alert("Proszę pobrać i zaznaczyć przynajmniej jeden folder do migracji!");
+    return;
+  }
+
   const btn = document.getElementById('start-btn');
   btn.disabled = true;
   btn.textContent = 'Uruchamianie...';
@@ -659,7 +766,7 @@ document.getElementById('setup-form').addEventListener('submit', async (e) => {
     dst_port: parseInt(document.getElementById('d_port').value),
     dst_user: document.getElementById('d_user').value,
     dst_pass: document.getElementById('d_pass').value,
-    folders: document.getElementById('folders').value.split(',').map(f=>f.trim()).filter(f=>f)
+    folders: selectedFolders
   };
   
   await fetch('/api/start', {
@@ -683,6 +790,30 @@ def index():
 def api_status():
     return jsonify(STATE.snapshot())
 
+@app.route("/api/folders", methods=["POST"])
+def api_folders():
+    data = request.json
+    try:
+        m = connect(data.get('host'), data.get('port'), data.get('user'), data.get('pass'))
+        typ, folders_data = m.list()
+        folders = []
+        if typ == 'OK':
+            for line in folders_data:
+                if not line: continue
+                # Dekodowanie IMAP LIST z wyrażenia regularnego
+                decoded = line.decode('utf-8', 'ignore')
+                # line format: (\HasNoChildren) "/" "INBOX"
+                match = re.match(r'\((?P<flags>.*?)\)\s+"?(?P<delimiter>.*?)"?\s+"?(?P<name>.*?)"?$', decoded)
+                if match:
+                    folders.append(match.group('name'))
+        m.logout()
+        # Odślepianie UTF-7 dla czytelności (opcjonalnie, ale w UI lepiej widzieć zdekodowane)
+        # UWAGA: formularz wysyła "value" takie samo, co musimy traktować jako czyste nazwy do pobierania.
+        # W skrypcie imap_utf7_decode robi tylko wyswietlanie, ale nazwy bazowe w array foldery muszą być "z serwera".
+        return jsonify({"folders": folders})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
 @app.route("/api/start", methods=["POST"])
 def api_start():
     data = request.json
@@ -700,7 +831,7 @@ def api_start():
         STATE.dst_user = data.get("dst_user")
         STATE.dst_pass = data.get("dst_pass")
         
-        STATE.folders = data.get("folders", ["INBOX", "[Gmail]/Wyslane"])
+        STATE.folders = data.get("folders", ["INBOX"])
         STATE.started_at = datetime.now(timezone.utc).isoformat()
     
     if not _started.is_set():
