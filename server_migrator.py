@@ -264,9 +264,14 @@ def worker(wid, src_cfg, dst_cfg, folder, target, job_ids, existing, ex_lock, co
                         raw = part[1]; break
                 if raw is None: continue
 
+                msgid = None
                 try:
-                    parsed = email.message_from_bytes(raw)
-                    msgid = norm_msgid(parsed.get('Message-ID'))
+                    # Optymalizacja pamięci: nie parsujemy całego pliku strukturalnie, co dla 50MB załącznika zjada mnóstwo RAMu.
+                    # Przeszukujemy tylko pierwsze 50 KB w poszukiwaniu Message-ID przy pomocy regexu.
+                    head_chunk = raw[:50000]
+                    match = re.search(br'(?mi)^Message-ID:\s*([^\r\n]+)', head_chunk)
+                    if match:
+                        msgid = norm_msgid(match.group(1).decode('utf-8', 'ignore'))
                 except Exception:
                     msgid = None
 
@@ -296,6 +301,11 @@ def worker(wid, src_cfg, dst_cfg, folder, target, job_ids, existing, ex_lock, co
                 with st.lock:
                     st.copied_total += 1
                     st.folder_done += 1
+                
+                # Agresywne uwalnianie pamięci: usuwamy potężną zmienną raw
+                del raw
+                if counters['done'] % 20 == 0:
+                    import gc; gc.collect()
             except Exception as e:
                 if is_limit_error(e):
                     st.log(f"   [watek {wid}] LIMIT/zerwanie: {e}")
