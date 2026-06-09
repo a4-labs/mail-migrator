@@ -739,13 +739,13 @@ document.getElementById('fetch-folders-btn').addEventListener('click', async (e)
         div.className = 'folder-item';
         const chk = document.createElement('input');
         chk.type = 'checkbox';
-        chk.value = f;
+        chk.value = f.name;
         // Domyślnie zaznaczamy znane
-        if(f === 'INBOX' || f.toLowerCase().includes('wyslane') || f.toLowerCase().includes('sent')) {
+        if(f.name === 'INBOX' || f.name.toLowerCase().includes('wyslane') || f.name.toLowerCase().includes('sent')) {
           chk.checked = true;
         }
         div.appendChild(chk);
-        div.appendChild(document.createTextNode(f));
+        div.appendChild(document.createTextNode(`${f.name} (${f.count} maili)`));
         list.appendChild(div);
       });
       container.classList.remove('hidden');
@@ -822,7 +822,17 @@ def api_folders():
                 # line format: (\HasNoChildren) "/" "INBOX"
                 match = re.match(r'\((?P<flags>.*?)\)\s+"?(?P<delimiter>.*?)"?\s+"?(?P<name>.*?)"?$', decoded)
                 if match:
-                    folders.append(match.group('name'))
+                    name = match.group('name')
+                    count = "0"
+                    try:
+                        styp, sdata = m.status(f'"{name}"', '(MESSAGES)')
+                        if styp == 'OK' and sdata and sdata[0]:
+                            cmatch = re.search(br'MESSAGES\s+(\d+)', sdata[0])
+                            if cmatch:
+                                count = cmatch.group(1).decode()
+                    except:
+                        pass
+                    folders.append({"name": name, "count": count})
         m.logout()
         # Odślepianie UTF-7 dla czytelności (opcjonalnie, ale w UI lepiej widzieć zdekodowane)
         # UWAGA: formularz wysyła "value" takie samo, co musimy traktować jako czyste nazwy do pobierania.
