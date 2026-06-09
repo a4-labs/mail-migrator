@@ -47,7 +47,7 @@ class State:
         self.dst_pass = ""
         self.folders = []
         self.workers = 2
-        self.retry_hours = 6.0
+        self.retry_hours = 2.0
 
     def log(self, msg):
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
