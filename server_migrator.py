@@ -160,25 +160,29 @@ def existing_index(dst, target, st):
         nums = data[0].split()
         if not nums:
             return existing, unseen
-        seq = b','.join(nums).decode()
-        typ, fetched = dst.fetch(seq, '(FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
-        if typ != 'OK' or not fetched:
-            return existing, unseen
-        cur_num, cur_seen = None, False
-        for part in fetched:
-            if isinstance(part, tuple):
-                meta = part[0].decode('utf-8', 'replace')
-                head = meta.strip().split(' ', 1)[0]
-                cur_num = head if head.isdigit() else None
-                cur_seen = '\\Seen' in meta
-                if part[1]:
-                    line = part[1].decode('utf-8', 'replace')
-                    if ':' in line:
-                        n = norm_msgid(line.split(':', 1)[1])
-                        if n:
-                            existing.add(n)
-                            if not cur_seen and cur_num:
-                                unseen[n] = cur_num
+        # Chunkowanie zapytania FETCH (podział na mniejsze paczki po 500)
+        chunk_size = 500
+        for i in range(0, len(nums), chunk_size):
+            chunk = nums[i:i + chunk_size]
+            seq = b','.join(chunk).decode()
+            typ, fetched = dst.fetch(seq, '(FLAGS BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
+            if typ != 'OK' or not fetched:
+                continue
+            cur_num, cur_seen = None, False
+            for part in fetched:
+                if isinstance(part, tuple):
+                    meta = part[0].decode('utf-8', 'replace')
+                    head = meta.strip().split(' ', 1)[0]
+                    cur_num = head if head.isdigit() else None
+                    cur_seen = '\\Seen' in meta
+                    if part[1]:
+                        line = part[1].decode('utf-8', 'replace')
+                        if ':' in line:
+                            n = norm_msgid(line.split(':', 1)[1])
+                            if n:
+                                existing.add(n)
+                                if not cur_seen and cur_num:
+                                    unseen[n] = cur_num
     except Exception as e:
         st.log(f"   (indeks duplikatow: {e})")
     return existing, unseen
@@ -198,22 +202,25 @@ def mark_seen(dst_cfg, target, msgids, st):
         if typ != 'OK' or not data or not data[0]:
             return 0
         nums = data[0].split()
-        seq = b','.join(nums).decode()
-        typ, fetched = dst.fetch(seq, '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
-        if typ != 'OK' or not fetched:
-            return 0
         to_mark, cur_num = [], None
-        for part in fetched:
-            if isinstance(part, tuple):
-                meta = part[0].decode('utf-8', 'replace')
-                head = meta.strip().split(' ', 1)[0]
-                cur_num = head if head.isdigit() else None
-                if part[1] and cur_num:
-                    line = part[1].decode('utf-8', 'replace')
-                    if ':' in line:
-                        n = norm_msgid(line.split(':', 1)[1])
-                        if n and n in wanted:
-                            to_mark.append(cur_num)
+        chunk_size = 500
+        for i in range(0, len(nums), chunk_size):
+            chunk = nums[i:i + chunk_size]
+            seq = b','.join(chunk).decode()
+            typ, fetched = dst.fetch(seq, '(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')
+            if typ != 'OK' or not fetched:
+                continue
+            for part in fetched:
+                if isinstance(part, tuple):
+                    meta = part[0].decode('utf-8', 'replace')
+                    head = meta.strip().split(' ', 1)[0]
+                    cur_num = head if head.isdigit() else None
+                    if part[1] and cur_num:
+                        line = part[1].decode('utf-8', 'replace')
+                        if ':' in line:
+                            n = norm_msgid(line.split(':', 1)[1])
+                            if n and n in wanted:
+                                to_mark.append(cur_num)
         for j in range(0, len(to_mark), 200):
             batch = ','.join(to_mark[j:j + 200])
             dst.store(batch, '+FLAGS', '(\\Seen)')
