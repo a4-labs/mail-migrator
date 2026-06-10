@@ -6,6 +6,7 @@ Migrator poczty IMAP -> IMAP, wersja SERWEROWA z interaktywnym Web GUI.
 
 import os
 import re
+import json
 import time
 import base64
 import imaplib
@@ -16,6 +17,24 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify, request, render_template_string
 
 imaplib._MAXLINE = 10_000_000
+
+PROGRESS_FILE = "progress.json"
+
+def load_progress():
+    try:
+        with open(PROGRESS_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_progress(folder, last_seq_num):
+    p = load_progress()
+    p[folder] = last_seq_num
+    try:
+        with open(PROGRESS_FILE, 'w') as f:
+            json.dump(p, f)
+    except Exception:
+        pass
 
 # ===================== STAN GLOBALNY =====================
 
@@ -379,6 +398,17 @@ def migrate_once(st):
                 st.folder_total = len(ids)
             st.log(f"   maili w zrodle: {len(ids)}")
 
+            progress = load_progress()
+            start_from = progress.get(folder, 0)
+            # Przytnij listę wiadomości do tych, których numer jest większy niż ostatnio przetworzony
+            if start_from > 0:
+                ids = [mid for mid in ids if int(mid) > start_from]
+                st.log(f"   wznowienie od seq#: {start_from+1} (pozostalo {len(ids)} do przetworzenia)")
+            
+            if not ids:
+                st.log(f"   folder juz w pelni przetworzony, pomijam")
+                continue
+
             n = max(1, min(st.workers, len(ids)))
             buckets = [[] for _ in range(n)]
             for idx, mid in enumerate(ids):
@@ -397,6 +427,12 @@ def migrate_once(st):
 
             if counters['done'] > 0: any_new = True
             st.log(f"   skopiowano {counters['done']}, pominieto {counters['skipped']}")
+
+            # Zapisz postęp - najwyższy przetworzony numer
+            if ids:
+                last_seq = max(int(mid) for mid in ids)
+                save_progress(folder, last_seq)
+                st.log(f"   postep zapisany: seq#{last_seq}")
 
             if seen_msgids:
                 m = mark_seen(dst_cfg, target, seen_msgids, st)
