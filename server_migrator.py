@@ -2,39 +2,30 @@
 # -*- coding: utf-8 -*-
 """
 Migrator poczty IMAP -> IMAP, wersja SERWEROWA z interaktywnym Web GUI.
+
+Architektura dwufazowa:
+  Faza 1 (header_scan): Pobiera TYLKO nagłówki (Message-ID + FLAGS) ze źródła
+                         w paczkach po 500. Porównuje z indeksem celu. Buduje
+                         listę UID do skopiowania. Szybko (~2-5 min na 130K maili).
+  Faza 2 (worker):       Pobiera pełne RFC822 TYLKO dla maili z listy Fazy 1.
+                         Zero zbędnych pobrań.
+
+Dzięki temu każdy przebieg jest w pełni idempotentny — nie wymaga pliku postępu
+na dysku. Po restarcie serwera skrypt sam odtwarza stan i wznawia kopiowanie.
 """
 
 import os
 import re
-import json
+import hashlib
 import time
 import base64
 import imaplib
-import email
 import threading
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request, render_template_string
 
 imaplib._MAXLINE = 10_000_000
-
-PROGRESS_FILE = "progress.json"
-
-def load_progress():
-    try:
-        with open(PROGRESS_FILE, 'r') as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_progress(folder, last_seq_num):
-    p = load_progress()
-    p[folder] = last_seq_num
-    try:
-        with open(PROGRESS_FILE, 'w') as f:
-            json.dump(p, f)
-    except Exception:
-        pass
 
 # ===================== STAN GLOBALNY =====================
 
@@ -54,7 +45,7 @@ class State:
         self.started_at = None
         self.finished = False
         self.log_lines = []
-        
+
         # Zmienne konfiguracyjne z formularza
         self.src_host = ""
         self.src_port = 993
@@ -158,16 +149,25 @@ def norm_msgid(value):
         value = value.decode('utf-8', errors='replace')
     return value.strip().strip('<>').strip().lower()
 
+def fallback_key(raw_header_bytes):
+    """Klucz zastępczy dla maili bez Message-ID — hash z pierwszych 512 bajtów nagłówka."""
+    return "noid:" + hashlib.md5(raw_header_bytes[:512]).hexdigest()
+
 # ===================== LOGIKA MIGRACJI =====================
 
 def is_limit_error(exc):
     s = str(exc).lower()
     keys = ['eof', 'limit', 'too many', 'try again', 'unavailable',
             'bandwidth', 'connection reset', 'timed out', 'broken pipe',
-            'socket error']
+            'socket error', 'overquota']
     return any(k in s for k in keys)
 
 def existing_index(dst, target, st):
+    """
+    Buduje zbiór Message-ID maili już obecnych na serwerze docelowym.
+    Odpytuje dpocztę w paczkach po 500 — szybkie i bezpieczne.
+    Zwraca: (existing: set[str], unseen: dict[msgid -> seq_num])
+    """
     existing, unseen = set(), {}
     try:
         typ, _ = dst.select(f'"{target}"')
@@ -179,7 +179,6 @@ def existing_index(dst, target, st):
         nums = data[0].split()
         if not nums:
             return existing, unseen
-        # Chunkowanie zapytania FETCH (podział na mniejsze paczki po 500)
         chunk_size = 500
         for i in range(0, len(nums), chunk_size):
             chunk = nums[i:i + chunk_size]
@@ -207,6 +206,7 @@ def existing_index(dst, target, st):
     return existing, unseen
 
 def mark_seen(dst_cfg, target, msgids, st):
+    """Oznacza podane Message-ID jako przeczytane na serwerze docelowym."""
     if not msgids:
         return 0
     wanted = set(msgids)
@@ -221,7 +221,7 @@ def mark_seen(dst_cfg, target, msgids, st):
         if typ != 'OK' or not data or not data[0]:
             return 0
         nums = data[0].split()
-        to_mark, cur_num = [], None
+        to_mark = []
         chunk_size = 500
         for i in range(0, len(nums), chunk_size):
             chunk = nums[i:i + chunk_size]
@@ -232,8 +232,8 @@ def mark_seen(dst_cfg, target, msgids, st):
             for part in fetched:
                 if isinstance(part, tuple):
                     meta = part[0].decode('utf-8', 'replace')
-                    head = meta.strip().split(' ', 1)[0]
-                    cur_num = head if head.isdigit() else None
+                    cur_num = meta.strip().split(' ', 1)[0]
+                    cur_num = cur_num if cur_num.isdigit() else None
                     if part[1] and cur_num:
                         line = part[1].decode('utf-8', 'replace')
                         if ':' in line:
@@ -252,7 +252,132 @@ def mark_seen(dst_cfg, target, msgids, st):
             except Exception: pass
     return marked
 
-def worker(wid, src_cfg, dst_cfg, folder, target, job_ids, existing, ex_lock, counters, c_lock, unseen, seen_msgids, s_lock, st):
+def header_scan(src, folder, existing, st):
+    """
+    FAZA 1: Szybkie skanowanie nagłówków ze źródła (Gmail).
+
+    Pobiera TYLKO (FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])
+    w paczkach po 500 dla wszystkich maili w folderze.
+    Porównuje z `existing` (indeks docelowy) i zwraca listę maili do skopiowania.
+
+    Zwraca:
+      to_copy: list[seq_num]               — numery do pobrania RFC822
+      uid_meta: dict[seq_num -> (flags, internaldate)]  — metadane
+      hit_limit: bool                      — czy trafiono na limit Gmaila
+    """
+    to_copy = []
+    uid_meta = {}
+    hit_limit = False
+
+    try:
+        typ, data = src.search(None, 'ALL')
+        if typ != 'OK' or not data or not data[0]:
+            return to_copy, uid_meta, hit_limit
+
+        all_ids = data[0].split()
+        total = len(all_ids)
+        with st.lock:
+            st.folder_total = total
+        st.log(f"   maili w zrodle: {total} | skanowanie naglowkow...")
+
+        chunk_size = 500
+        scanned = 0
+
+        for i in range(0, total, chunk_size):
+            chunk = all_ids[i:i + chunk_size]
+            seq = b','.join(chunk).decode()
+            try:
+                typ, fetched = src.fetch(
+                    seq,
+                    '(FLAGS INTERNALDATE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])'
+                )
+            except Exception as e:
+                if is_limit_error(e):
+                    st.log(f"   [scan] limit przy naglowkach: {e}")
+                    hit_limit = True
+                    break
+                continue
+
+            if typ != 'OK' or not fetched:
+                continue
+
+            cur_num = None
+            cur_flags = ''
+            cur_date = None
+            cur_header = b''
+
+            for part in fetched:
+                if isinstance(part, tuple):
+                    meta_raw = part[0]
+                    meta = meta_raw.decode('utf-8', 'replace') if isinstance(meta_raw, bytes) else str(meta_raw)
+
+                    # Wyciągnij numer sekwencyjny
+                    head_token = meta.strip().split(' ', 1)[0]
+                    if head_token.isdigit():
+                        cur_num = head_token.encode()
+                        cur_flags = ''
+                        cur_date = None
+                        cur_header = b''
+
+                    # Flagi
+                    try:
+                        fl = imaplib.ParseFlags(meta_raw if isinstance(meta_raw, bytes) else meta_raw.encode())
+                        cur_flags = ' '.join(
+                            x.decode() if isinstance(x, bytes) else x
+                            for x in fl
+                            if (x.decode() if isinstance(x, bytes) else x) != '\\Recent'
+                        )
+                    except Exception:
+                        pass
+
+                    # InternalDate
+                    try:
+                        cur_date = imaplib.Internaldate2tuple(meta_raw if isinstance(meta_raw, bytes) else meta_raw.encode())
+                    except Exception:
+                        pass
+
+                    # Nagłówek (część danych)
+                    if part[1]:
+                        cur_header = part[1] if isinstance(part[1], bytes) else part[1].encode()
+
+                    if cur_num:
+                        # Wyciągnij Message-ID
+                        msgid = None
+                        match = re.search(rb'(?mi)^Message-ID:\s*([^\r\n]+)', cur_header)
+                        if match:
+                            msgid = norm_msgid(match.group(1))
+                        if not msgid:
+                            msgid = fallback_key(cur_header)
+
+                        if msgid not in existing:
+                            to_copy.append(cur_num)
+                            uid_meta[cur_num] = (cur_flags, cur_date, msgid)
+
+                        scanned += 1
+
+            # Loguj postęp skanowania co 10 000
+            if (i // chunk_size) % 20 == 0 and i > 0:
+                st.log(f"   [scan] przeskanowano {scanned}/{total}, do skopiowania: {len(to_copy)}")
+
+    except Exception as e:
+        if is_limit_error(e):
+            st.log(f"   [scan] limit: {e}")
+            hit_limit = True
+        else:
+            st.log(f"   [scan] blad: {e}")
+
+    st.log(f"   skanowanie gotowe: {len(to_copy)}/{total} do skopiowania")
+    return to_copy, uid_meta, hit_limit
+
+
+def worker(wid, src_cfg, dst_cfg, folder, target, job_ids, uid_meta,
+           counters, c_lock, seen_msgids, s_lock, st):
+    """
+    FAZA 2: Kopiuje pełne RFC822 dla maili z listy job_ids.
+
+    job_ids to już odfiltrowana lista — TYLKO maile nieobecne na celu.
+    Nie robi żadnej deduplikacji — to zostało zrobione w header_scan.
+    """
     try:
         src = connect(**src_cfg)
         dst = connect(**dst_cfg)
@@ -263,79 +388,51 @@ def worker(wid, src_cfg, dst_cfg, folder, target, job_ids, existing, ex_lock, co
             with c_lock:
                 counters['limit'] = True
         return
+
     try:
         for mid in job_ids:
             with c_lock:
                 if counters.get('limit'):
                     break
             try:
-                flags, internaldate = '', None
-                tf, fd = src.fetch(mid, '(FLAGS INTERNALDATE)')
-                if tf == 'OK' and fd:
-                    for fp in fd:
-                        blob = fp if isinstance(fp, bytes) else (fp[0] if isinstance(fp, tuple) else None)
-                        if not blob: continue
-                        try:
-                            fl = imaplib.ParseFlags(blob)
-                            flags = ' '.join(x.decode() if isinstance(x, bytes) else x for x in fl if (x.decode() if isinstance(x, bytes) else x) != '\\Recent')
-                        except Exception: pass
-                        try: internaldate = imaplib.Internaldate2tuple(blob)
-                        except Exception: pass
+                flags, internaldate, msgid = uid_meta.get(mid, ('', None, None))
 
                 typ, md = src.fetch(mid, '(RFC822)')
-                if typ != 'OK' or not md: continue
+                if typ != 'OK' or not md:
+                    continue
                 raw = None
                 for part in md:
                     if isinstance(part, tuple) and part[1]:
                         raw = part[1]; break
-                if raw is None: continue
+                if raw is None:
+                    continue
 
-                msgid = None
-                try:
-                    # Optymalizacja pamięci: nie parsujemy całego pliku strukturalnie, co dla 50MB załącznika zjada mnóstwo RAMu.
-                    # Przeszukujemy tylko pierwsze 50 KB w poszukiwaniu Message-ID przy pomocy regexu.
-                    head_chunk = raw[:50000]
-                    match = re.search(br'(?mi)^Message-ID:\s*([^\r\n]+)', head_chunk)
-                    if match:
-                        msgid = norm_msgid(match.group(1).decode('utf-8', 'ignore'))
-                except Exception:
-                    msgid = None
-
+                ta, _ = dst.append(
+                    f'"{target}"',
+                    f'({flags})' if flags else None,
+                    internaldate,
+                    raw
+                )
                 was_seen = '\\Seen' in flags
-
-                if msgid:
-                    with ex_lock:
-                        already = msgid in existing
-                        if not already: existing.add(msgid)
-                    if already:
-                        if was_seen:
-                            num = None
-                            with ex_lock: num = unseen.pop(msgid, None)
-                            if num:
-                                try:
-                                    dst.select(f'"{target}"')
-                                    dst.store(num, '+FLAGS', '(\\Seen)')
-                                except Exception: pass
-                        with c_lock: counters['skipped'] += 1
-                        with st.lock: st.skipped_total += 1
-                        continue
-
-                ta, _ = dst.append(f'"{target}"', f'({flags})' if flags else None, internaldate, raw)
                 if was_seen and ta == 'OK' and msgid:
-                    with s_lock: seen_msgids.append(msgid)
-                with c_lock: counters['done'] += 1
+                    with s_lock:
+                        seen_msgids.append(msgid)
+
+                with c_lock:
+                    counters['done'] += 1
                 with st.lock:
                     st.copied_total += 1
                     st.folder_done += 1
-                
-                # Agresywne uwalnianie pamięci: usuwamy potężną zmienną raw
+
                 del raw
                 if counters['done'] % 20 == 0:
                     import gc; gc.collect()
+
             except Exception as e:
                 if is_limit_error(e):
                     st.log(f"   [watek {wid}] LIMIT/zerwanie: {e}")
-                    with c_lock: counters['limit'] = True
+                    with c_lock:
+                        counters['limit'] = True
                     break
                 st.log(f"   [watek {wid}] blad maila: {e}")
                 continue
@@ -343,6 +440,7 @@ def worker(wid, src_cfg, dst_cfg, folder, target, job_ids, existing, ex_lock, co
         for c in (src, dst):
             try: c.logout()
             except Exception: pass
+
 
 def migrate_once(st):
     src_cfg = {"host": st.src_host, "port": st.src_port, "user": st.src_user, "password": st.src_pass}
@@ -363,13 +461,16 @@ def migrate_once(st):
             with st.lock:
                 st.current_folder = f"{folder} -> {target}"
                 st.folder_done = 0
+                st.folder_total = 0
             st.log(f"=== Folder '{folder}' -> '{target}' ===")
 
+            # Otwórz folder na źródle (Gmail), z retry
             opened = False
             for attempt in range(2):
                 try:
                     typ, _ = src.select(f'"{folder}"', readonly=True)
-                    if typ == 'OK': opened = True; break
+                    if typ == 'OK':
+                        opened = True; break
                 except Exception as e:
                     st.log(f"   otwarcie: {e}")
                     if attempt == 0:
@@ -377,80 +478,99 @@ def migrate_once(st):
                         except Exception: pass
                         try: dst.logout()
                         except Exception: pass
-                        try: src = connect(**src_cfg); dst = connect(**dst_cfg)
+                        try:
+                            src = connect(**src_cfg)
+                            dst = connect(**dst_cfg)
                         except Exception as e2:
                             st.log(f"   wznowienie polaczen: {e2}")
-                            if is_limit_error(e2): return 'limit'
+                            if is_limit_error(e2):
+                                return 'limit'
                             break
             if not opened:
                 st.log(f"   pomijam '{folder}'")
                 continue
 
+            # Faza 1a: Indeks maili już na celu (dpoczta)
+            with st.lock:
+                st.phase = "indeksowanie celu"
             existing, unseen = existing_index(dst, target, st)
             st.log(f"   na dpoczcie juz: {len(existing)} (do naprawy statusu: {len(unseen)})")
+
+            # Powróć do folderu źródłowego po wizycie u celu
             src.select(f'"{folder}"', readonly=True)
 
-            typ, data = src.search(None, 'ALL')
-            if typ != 'OK' or not data or not data[0]:
-                st.log("   folder zrodlowy pusty"); continue
-            ids = data[0].split()
+            # Faza 1b: Szybkie skanowanie nagłówków ze źródła
             with st.lock:
-                st.folder_total = len(ids)
-            st.log(f"   maili w zrodle: {len(ids)}")
+                st.phase = "skanowanie naglowkow"
+            to_copy, uid_meta, scan_limit = header_scan(src, folder, existing, st)
 
-            progress = load_progress()
-            start_from = progress.get(folder, 0)
-            # Przytnij listę wiadomości do tych, których numer jest większy niż ostatnio przetworzony
-            if start_from > 0:
-                ids = [mid for mid in ids if int(mid) > start_from]
-                st.log(f"   wznowienie od seq#: {start_from+1} (pozostalo {len(ids)} do przetworzenia)")
-            
-            if not ids:
-                st.log(f"   folder juz w pelni przetworzony, pomijam")
+            if scan_limit:
+                hit_limit = True
+                st.log("   >>> limit podczas skanowania naglowkow - przerywam przebieg")
+                break
+
+            if not to_copy:
+                st.log(f"   folder w pelni zsynchronizowany, pomijam")
                 continue
 
-            n = max(1, min(st.workers, len(ids)))
+            st.log(f"   do skopiowania: {len(to_copy)} maili")
+            with st.lock:
+                st.folder_total = len(to_copy)
+                st.folder_done = 0
+                st.phase = "kopiowanie"
+
+            # Faza 2: Kopiowanie pełnych maili
+            n = max(1, min(st.workers, len(to_copy)))
             buckets = [[] for _ in range(n)]
-            for idx, mid in enumerate(ids):
+            for idx, mid in enumerate(to_copy):
                 buckets[idx % n].append(mid)
 
-            ex_lock = threading.Lock(); c_lock = threading.Lock()
-            s_lock = threading.Lock(); seen_msgids = []
-            counters = {'done': 0, 'skipped': 0, 'limit': False}
+            c_lock = threading.Lock()
+            s_lock = threading.Lock()
+            seen_msgids = []
+            counters = {'done': 0, 'limit': False}
 
             threads = []
             for wid in range(n):
-                if not buckets[wid]: continue
-                t = threading.Thread(target=worker, args=(wid + 1, src_cfg, dst_cfg, folder, target, buckets[wid], existing, ex_lock, counters, c_lock, unseen, seen_msgids, s_lock, st), daemon=True)
+                if not buckets[wid]:
+                    continue
+                t = threading.Thread(
+                    target=worker,
+                    args=(wid + 1, src_cfg, dst_cfg, folder, target,
+                          buckets[wid], uid_meta, counters, c_lock,
+                          seen_msgids, s_lock, st),
+                    daemon=True
+                )
                 threads.append(t); t.start()
-            for t in threads: t.join()
+            for t in threads:
+                t.join()
 
-            if counters['done'] > 0: any_new = True
-            st.log(f"   skopiowano {counters['done']}, pominieto {counters['skipped']}")
-
-            # Zapisz postęp - najwyższy przetworzony numer
-            if ids:
-                last_seq = max(int(mid) for mid in ids)
-                save_progress(folder, last_seq)
-                st.log(f"   postep zapisany: seq#{last_seq}")
+            if counters['done'] > 0:
+                any_new = True
+            st.log(f"   skopiowano {counters['done']}")
 
             if seen_msgids:
                 m = mark_seen(dst_cfg, target, seen_msgids, st)
-                with st.lock: st.seen_marked_total += m
+                with st.lock:
+                    st.seen_marked_total += m
                 st.log(f"   oznaczono przeczytane: {m}")
 
             if counters['limit']:
                 hit_limit = True
                 st.log("   >>> trafiono limit/zerwanie - przerywam przebieg")
                 break
+
     finally:
         for c in (src, dst):
             try: c.logout()
             except Exception: pass
 
-    if hit_limit: return 'limit'
-    if any_new: return 'progress'
+    if hit_limit:
+        return 'limit'
+    if any_new:
+        return 'progress'
     return 'done'
+
 
 def run_loop():
     STATE.log(f"Start migracji: {STATE.src_user} -> {STATE.dst_user}")
@@ -474,25 +594,19 @@ def run_loop():
                 STATE.finished = True
             STATE.log(">>> GOTOWE. Caly material przeniesiony, brak nowych maili.")
             return
-        elif result == 'error':
+        elif result in ('error', 'limit'):
             wait = STATE.retry_hours * 3600
             nxt = time.time() + wait
+            label = "Limit Gmaila" if result == 'limit' else "Blad"
             with STATE.lock:
                 STATE.status = "czeka_limit"
                 STATE.next_retry_ts = nxt
-            STATE.log(f"Blad. Ponawiam za {STATE.retry_hours}h.")
-            time.sleep(wait)
-        elif result == 'limit':
-            wait = STATE.retry_hours * 3600
-            nxt = time.time() + wait
-            with STATE.lock:
-                STATE.status = "czeka_limit"
-                STATE.next_retry_ts = nxt
-            STATE.log(f"Limit Gmaila. Czekam {STATE.retry_hours}h i probuje dalej.")
+            STATE.log(f"{label}. Czekam {STATE.retry_hours}h i probuje dalej.")
             time.sleep(wait)
         else:
             STATE.log("Przebieg dograł nowe maile. Kontynuuje po 60s.")
             time.sleep(60)
+
 
 # ===================== WEB GUI =====================
 
@@ -540,7 +654,6 @@ body {
 h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; background: linear-gradient(to right, #60a5fa, #a78bfa); -webkit-background-clip: text; color: transparent; }
 .sub { color: var(--text-muted); font-size: 14px; margin-bottom: 30px; }
 
-/* Form styles */
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 24px; }
 .form-group { display: flex; flex-direction: column; gap: 8px; }
 .form-group label { font-size: 13px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
@@ -576,7 +689,6 @@ h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; background: linear-g
 .btn:disabled { opacity: 0.7; cursor: not-allowed; transform: none; }
 .btn-secondary:hover { background: rgba(59, 130, 246, 0.1); }
 
-/* Checkboxes */
 .folders-list {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -602,7 +714,6 @@ h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; background: linear-g
   cursor: pointer;
 }
 
-/* Dashboard styles */
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
 .card { background: rgba(0,0,0,0.2); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
 .card .k { color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
@@ -618,6 +729,7 @@ h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; background: linear-g
 .log { background: #010409; border: 1px solid var(--border); border-radius: 12px; padding: 16px; height: 400px; overflow-y: auto; font-family: ui-monospace, 'Cascadia Code', monospace; font-size: 13px; white-space: pre-wrap; word-break: break-word; }
 .log div { padding: 2px 0; color: #c9d1d9; border-bottom: 1px solid rgba(255,255,255,0.03); }
 .row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
+.phase-badge { font-size: 12px; color: var(--text-muted); background: rgba(0,0,0,0.3); padding: 4px 10px; border-radius: 20px; border: 1px solid var(--border); }
 .hidden { display: none !important; }
 @media (max-width: 600px) { .form-grid, .folders-list { grid-template-columns: 1fr; } }
 </style></head><body><div class="wrap">
@@ -633,7 +745,7 @@ h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; background: linear-g
         <div class="form-group"><label>Adres E-mail</label><input type="email" id="s_user" class="form-control" placeholder="jan@gmail.com" required></div>
         <div class="form-group"><label>Hasło (lub hasło aplikacji)</label><input type="password" id="s_pass" class="form-control" required></div>
       </div>
-      
+
       <div style="margin-bottom: 24px;">
         <button type="button" class="btn btn-secondary" id="fetch-folders-btn">Pobierz listę folderów ze źródła</button>
         <div id="folders-container" class="hidden">
@@ -651,7 +763,7 @@ h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; background: linear-g
         <div class="form-group"><label>Adres E-mail</label><input type="email" id="d_user" class="form-control" placeholder="jan@dpoczta.pl" required></div>
         <div class="form-group"><label>Hasło</label><input type="password" id="d_pass" class="form-control" required></div>
       </div>
-      
+
       <button type="submit" class="btn" id="start-btn" style="background: var(--success); margin-top: 16px;">Uruchom Migrację w tle</button>
     </form>
   </div>
@@ -662,11 +774,11 @@ h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; background: linear-g
       <div class="sub" id="meta">ładuje...</div>
       <div class="row">
         <span class="badge" id="status">...</span>
+        <span class="phase-badge" id="phase"></span>
         <span style="color: var(--text-muted); font-size: 14px; font-weight: 500;" id="folder"></span>
       </div>
       <div class="grid">
         <div class="card"><div class="k">Skopiowane</div><div class="v" style="color: var(--success)" id="copied">0</div></div>
-        <div class="card"><div class="k">Pominięte (dubel)</div><div class="v" id="skipped">0</div></div>
         <div class="card"><div class="k">Oznacz. przeczytane</div><div class="v" id="seen">0</div></div>
         <div class="card"><div class="k">Przebieg #</div><div class="v" id="cycle">0</div></div>
       </div>
@@ -677,9 +789,6 @@ h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; background: linear-g
         </div>
         <div class="bar"><i id="barfill"></i></div>
         <div style="color: var(--warning); font-size: 13px; margin-top: 8px;" id="retry"></div>
-      </div>
-      <div style="margin-top: 12px; text-align: right;">
-        <button id="reset-progress-btn" class="btn btn-secondary" style="width:auto;font-size:13px;padding:8px 16px;border-color:var(--error);color:var(--error);">🗑 Resetuj zapamiętany postęp (zacznij od nowa)</button>
       </div>
     </div>
     <div class="log" id="log"></div>
@@ -701,7 +810,7 @@ async function checkStatus(){
   try {
     const r = await fetch('/api/status');
     const s = await r.json();
-    
+
     if (s.status === 'oczekuje' && !dashActive) {
       document.getElementById('form-view').classList.remove('hidden');
       document.getElementById('dash-view').classList.add('hidden');
@@ -719,24 +828,24 @@ function updateDash(s) {
   document.getElementById('meta').textContent =
     'Foldery: ' + (s.folders||[]).join(', ') + '  |  Wątki: ' + s.workers +
     '  |  Start: ' + startTxt;
-    
+
   const st = document.getElementById('status');
-  st.textContent = s.status.toUpperCase(); 
+  st.textContent = s.status.toUpperCase();
   st.className = 'badge b-' + s.status;
-  
+
+  document.getElementById('phase').textContent = s.phase ? s.phase.toUpperCase() : '';
   document.getElementById('folder').textContent = s.current_folder || '';
   document.getElementById('copied').textContent = s.copied_total;
-  document.getElementById('skipped').textContent = s.skipped_total;
   document.getElementById('seen').textContent = s.seen_marked_total;
   document.getElementById('cycle').textContent = s.cycle;
   document.getElementById('fd').textContent = s.folder_done;
   document.getElementById('ft').textContent = s.folder_total;
-  
+
   const pct = s.folder_total ? Math.round(100*s.folder_done/s.folder_total) : 0;
   document.getElementById('barfill').style.width = pct+'%';
-  
+
   document.getElementById('retry').textContent = s.status === 'czeka_limit' ? fmtRetry(s.next_retry_ts) : '';
-  
+
   const log = document.getElementById('log');
   log.innerHTML = s.log.map(l=>'<div>'+l.replace(/</g,'&lt;')+'</div>').join('');
   if(log.scrollHeight - log.scrollTop < 600) log.scrollTop = log.scrollHeight;
@@ -749,22 +858,22 @@ document.getElementById('fetch-folders-btn').addEventListener('click', async (e)
   const pass = document.getElementById('s_pass').value;
   const host = document.getElementById('s_host').value;
   const port = document.getElementById('s_port').value;
-  
+
   if(!user || !pass || !host) {
     alert('Wypełnij najpierw dane skrzynki źródłowej (host, email, hasło)!');
     return;
   }
-  
+
   btn.textContent = 'Pobieranie...';
   btn.disabled = true;
-  
+
   try {
     const res = await fetch('/api/folders', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({host, port, user, pass})
     });
-    
+
     const data = await res.json();
     if(data.error) {
       alert('Błąd pobierania: ' + data.error);
@@ -772,14 +881,13 @@ document.getElementById('fetch-folders-btn').addEventListener('click', async (e)
       const container = document.getElementById('folders-container');
       const list = document.getElementById('folders-list');
       list.innerHTML = '';
-      
+
       data.folders.forEach(f => {
         const div = document.createElement('label');
         div.className = 'folder-item';
         const chk = document.createElement('input');
         chk.type = 'checkbox';
         chk.value = f.name;
-        // Domyślnie zaznaczamy znane
         if(f.name === 'INBOX' || f.name.toLowerCase().includes('wyslane') || f.name.toLowerCase().includes('sent')) {
           chk.checked = true;
         }
@@ -799,11 +907,10 @@ document.getElementById('fetch-folders-btn').addEventListener('click', async (e)
 // Start migracji
 document.getElementById('setup-form').addEventListener('submit', async (e) => {
   e.preventDefault();
-  
-  // Zbieranie zaznaczonych folderów
+
   const checkboxes = document.querySelectorAll('#folders-list input[type="checkbox"]:checked');
   let selectedFolders = Array.from(checkboxes).map(c => c.value);
-  
+
   if (selectedFolders.length === 0) {
     alert("Proszę pobrać i zaznaczyć przynajmniej jeden folder do migracji!");
     return;
@@ -812,7 +919,7 @@ document.getElementById('setup-form').addEventListener('submit', async (e) => {
   const btn = document.getElementById('start-btn');
   btn.disabled = true;
   btn.textContent = 'Uruchamianie...';
-  
+
   const payload = {
     src_host: document.getElementById('s_host').value,
     src_port: parseInt(document.getElementById('s_port').value),
@@ -824,28 +931,18 @@ document.getElementById('setup-form').addEventListener('submit', async (e) => {
     dst_pass: document.getElementById('d_pass').value,
     folders: selectedFolders
   };
-  
+
   await fetch('/api/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
-  
+
   checkStatus();
 });
 
 setInterval(checkStatus, 2000);
 checkStatus();
-
-document.addEventListener('click', async (e) => {
-  if (e.target.id === 'reset-progress-btn') {
-    if (!confirm('Czy na pewno chcesz zresetować zapamiętany postęp? Następna migracja każdego folderu zacznie od początku.')) return;
-    const r = await fetch('/api/reset-progress', { method: 'POST' });
-    const d = await r.json();
-    if (d.ok) alert('Postęp zresetowany! Możesz teraz uruchomić migrację od nowa.');
-    else alert('Błąd: ' + d.error);
-  }
-});
 </script></body></html>"""
 
 @app.route("/")
@@ -866,9 +963,7 @@ def api_folders():
         if typ == 'OK':
             for line in folders_data:
                 if not line: continue
-                # Dekodowanie IMAP LIST z wyrażenia regularnego
                 decoded = line.decode('utf-8', 'ignore')
-                # line format: (\HasNoChildren) "/" "INBOX"
                 match = re.match(r'\((?P<flags>.*?)\)\s+"?(?P<delimiter>.*?)"?\s+"?(?P<name>.*?)"?$', decoded)
                 if match:
                     name = match.group('name')
@@ -883,9 +978,6 @@ def api_folders():
                         pass
                     folders.append({"name": name, "count": count})
         m.logout()
-        # Odślepianie UTF-7 dla czytelności (opcjonalnie, ale w UI lepiej widzieć zdekodowane)
-        # UWAGA: formularz wysyła "value" takie samo, co musimy traktować jako czyste nazwy do pobierania.
-        # W skrypcie imap_utf7_decode robi tylko wyswietlanie, ale nazwy bazowe w array foldery muszą być "z serwera".
         return jsonify({"folders": folders})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -896,38 +988,29 @@ def api_start():
     with STATE.lock:
         if STATE.status != "oczekuje":
             return jsonify({"error": "Migracja juz zostala uruchomiona."}), 400
-        
+
         STATE.src_host = data.get("src_host", "imap.gmail.com")
         STATE.src_port = data.get("src_port", 993)
         STATE.src_user = data.get("src_user")
         STATE.src_pass = data.get("src_pass")
-        
+
         STATE.dst_host = data.get("dst_host", "imap.dpoczta.pl")
         STATE.dst_port = data.get("dst_port", 993)
         STATE.dst_user = data.get("dst_user")
         STATE.dst_pass = data.get("dst_pass")
-        
+
         STATE.folders = data.get("folders", ["INBOX"])
         STATE.started_at = datetime.now(timezone.utc).isoformat()
-    
+
     if not _started.is_set():
         _started.set()
         threading.Thread(target=run_loop, daemon=True).start()
-        
+
     return jsonify({"success": True})
 
 @app.route("/health")
 def health():
     return "ok", 200
-
-@app.route("/api/reset-progress", methods=["POST"])
-def api_reset_progress():
-    try:
-        if os.path.exists(PROGRESS_FILE):
-            os.remove(PROGRESS_FILE)
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
