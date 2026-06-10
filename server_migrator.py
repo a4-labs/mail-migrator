@@ -678,6 +678,9 @@ h1 { font-size: 24px; font-weight: 700; margin-bottom: 8px; background: linear-g
         <div class="bar"><i id="barfill"></i></div>
         <div style="color: var(--warning); font-size: 13px; margin-top: 8px;" id="retry"></div>
       </div>
+      <div style="margin-top: 12px; text-align: right;">
+        <button id="reset-progress-btn" class="btn btn-secondary" style="width:auto;font-size:13px;padding:8px 16px;border-color:var(--error);color:var(--error);">🗑 Resetuj zapamiętany postęp (zacznij od nowa)</button>
+      </div>
     </div>
     <div class="log" id="log"></div>
   </div>
@@ -833,6 +836,16 @@ document.getElementById('setup-form').addEventListener('submit', async (e) => {
 
 setInterval(checkStatus, 2000);
 checkStatus();
+
+document.addEventListener('click', async (e) => {
+  if (e.target.id === 'reset-progress-btn') {
+    if (!confirm('Czy na pewno chcesz zresetować zapamiętany postęp? Następna migracja każdego folderu zacznie od początku.')) return;
+    const r = await fetch('/api/reset-progress', { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) alert('Postęp zresetowany! Możesz teraz uruchomić migrację od nowa.');
+    else alert('Błąd: ' + d.error);
+  }
+});
 </script></body></html>"""
 
 @app.route("/")
@@ -906,6 +919,15 @@ def api_start():
 @app.route("/health")
 def health():
     return "ok", 200
+
+@app.route("/api/reset-progress", methods=["POST"])
+def api_reset_progress():
+    try:
+        if os.path.exists(PROGRESS_FILE):
+            os.remove(PROGRESS_FILE)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
